@@ -37,6 +37,14 @@ def analyze(batch_id):
     batch = db.query_one("SELECT * FROM batches WHERE id=?", (batch_id,))
     if not batch:
         return {"status": "failed", "text": "批次不存在"}
+    if batch["status"] == "withdrawn":
+        return {"status": "withdrawn",
+                "text": f"批次#{batch_id} 的委托样品已全部撤回:该号的入仓行、"
+                        f"关联调用记录与批次清单已清除,本批次不再提供诊断结论。",
+                "t0": batch["created_at"], "t1": batch["finished_at"] or batch["created_at"],
+                "wall_s": 0, "samples_total": 0, "samples_stored": 0, "warehouse_rows": 0,
+                "client_calls": 0, "per_stage": {}, "work_parts_s": {},
+                "bottleneck": None, "chain": None, "blocking": None}
     sample_ids = list(dict.fromkeys(json.loads(batch["sample_ids"])))
     spans = db.query("SELECT * FROM spans WHERE batch_id=? ORDER BY start_ts,id", (batch_id,))
     wh = db.query("SELECT * FROM warehouse WHERE batch_id=?", (batch_id,))

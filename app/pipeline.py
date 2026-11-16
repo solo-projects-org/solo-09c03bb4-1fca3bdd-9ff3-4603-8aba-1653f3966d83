@@ -86,6 +86,8 @@ async def fetch_with_retry(batch_id, sample_id, cfg):
         req_id = _rid()
         span_id = db.insert_span(batch_id, sample_id, "fetch", "client", "orchestrator",
                                  attempt, req_id, "running", time.time())
+        if span_id is None:
+            return None  # 样品已撤回:不再发起取数,也不产生新记录
         task = asyncio.create_task(call_source(batch_id, sample_id, attempt, req_id, span_id))
         pending[task] = {"attempt": attempt, "req_id": req_id, "span_id": span_id}
         done, _ = await asyncio.wait(set(pending), timeout=timeout_s,
@@ -132,6 +134,8 @@ async def qc_call(batch_id, sample_id, check, payload):
     req_id = _rid()
     span_id = db.insert_span(batch_id, sample_id, stage, "client", "orchestrator",
                              1, req_id, "running", time.time())
+    if span_id is None:
+        return False  # 样品已撤回:不再调用质控,也不产生新记录
     try:
         r = await http().post(f"{QC_URL}/check/{check}",
                               json={**payload, "request_id": req_id, "batch_id": batch_id})
@@ -157,6 +161,8 @@ async def process_sample(batch_id, sample_id, cfg):
     data = await fetch_with_retry(batch_id, sample_id, cfg)
     if data is None:
         return False
+    if db.is_withdrawn(sample_id):
+        return False  # 取数间隙被撤回:不再质控/入仓,结果直接丢弃
     req_id_used = data.pop("_req_id")
     returned_id = str(data.get("sample_id"))
     payload = {"sample_id": returned_id, "expected_sample_id": sample_id,
@@ -169,11 +175,13 @@ async def process_sample(batch_id, sample_id, cfg):
         return False
     span_id = db.insert_span(batch_id, sample_id, "warehouse", "client", "orchestrator",
                              1, _rid(), "running", time.time())
+    if span_id is None:
+        return False  # 质控间隙被撤回:不再入仓
     inserted = db.warehouse_insert(batch_id, sample_id, data.get("concentration"), req_id_used)
     db.finish_span(span_id, time.time(), "ok",
                    {"inserted": inserted, "concentration": data.get("concentration"),
                     "source_request_id": req_id_used},
-                   note=None if inserted else " 唯一约束去重：该样品已有入仓记录，未重复写入。")
+                   note=None if inserted else " 唯一约束去重/已撤回：未重复写入。")
     return True
 
 
@@ -191,5 +199,7 @@ async def run_batch(batch_id, sample_ids):
     _finalizers.pop(batch_id, None)
     concl = analysis.analyze(batch_id)
     status = "done" if concl.get("status") == "done" else "failed"
-    db.execute("UPDATE batches SET status=?, finished_at=?, conclusion=? WHERE id=?",
+    # 仅当批次仍为 running 时定稿:运行中被全部撤回的批次保持"已撤回",不被覆盖
+    db.execute("UPDATE batches SET status=?, finished_at=?, conclusion=?"
+               " WHERE id=? AND status='running'",
                (status, time.time(), json.dumps(concl, ensure_ascii=False), batch_id))

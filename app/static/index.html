@@ -32,6 +32,8 @@
   tr.clickable:hover { background: #ddf4ff; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; color: #fff; }
   .st-running { background: #1e88e5; } .st-done { background: #2e7d32; } .st-failed { background: #c62828; }
+  .st-withdrawn { background: #6e7781; }
+  .concl.withdrawn { background: #f6f8fa; border-left-color: #6e7781; }
   .muted { color: #57606a; } .mono { font-family: ui-monospace, monospace; }
   .concl { background: #f0f6ff; border-left: 4px solid #1f6feb; padding: 8px 12px; border-radius: 4px; }
   .concl.fail { background: #fff0f0; border-left-color: #c62828; }
@@ -108,6 +110,20 @@ S1006</textarea>
   </table>
 </section>
 
+<section>
+  <h2>④ 撤回误录样品号(按委托样品号清除全部批次中的测值与诊断证据)</h2>
+  <div style="display:flex;gap:8px;align-items:center">
+    <input type="text" id="withdrawId" placeholder="委托样品号,如 S1003"
+           style="padding:5px 8px;border:1px solid var(--bd);border-radius:6px;width:220px">
+    <button onclick="withdrawSample()" style="background:#c62828">撤回该号</button>
+  </div>
+  <div class="muted" style="font-size:12px;margin-top:6px">
+    清除该号在全部批次中的入仓行、关联调用记录(含错位返回证据)与批次清单,并按剩余样品重算结论;
+    批次样品全部撤回时状态显示"已撤回"。撤回后该号(及错位返回号)不得再提交,
+    进行中的取数/质控与迟到上报也不再写入。</div>
+  <div id="withdrawResult" style="margin-top:8px"></div>
+</section>
+
 <section id="detail" hidden>
   <h2 id="detailTitle">批次详情</h2>
   <div id="conclBox"></div>
@@ -130,6 +146,7 @@ S1006</textarea>
 <script>
 const STAGE_LABEL = {fetch:'取数', qc_nonneg:'质控①非负', qc_match:'质控②对应', warehouse:'入仓'};
 const STAGE_ORDER = {fetch:0, qc_nonneg:1, qc_match:2, warehouse:3};
+const STATUS_LABEL = {running:'running', done:'done', failed:'failed', withdrawn:'已撤回'};
 let currentBatch = null, currentDetail = null;
 
 function fmtTs(t){ if(!t) return '-'; const d=new Date(t*1000);
@@ -166,7 +183,7 @@ async function refreshBatches(){
   const rows = await (await fetch('/api/batches')).json();
   const tb = document.querySelector('#batchTable tbody');
   tb.innerHTML = rows.map(b=>`<tr class="clickable" onclick="openBatch(${b.id})">
-    <td>#${b.id}</td><td><span class="pill st-${b.status}">${b.status}</span></td>
+    <td>#${b.id}</td><td><span class="pill st-${b.status}">${STATUS_LABEL[b.status]||b.status}</span></td>
     <td>${b.samples}</td><td>${b.stored??'-'}</td><td>${b.wall_s??'-'}</td>
     <td>${b.bottleneck??'-'}</td><td class="mono">${fmtTs(b.created_at)}</td>
     <td><button class="ghost" onclick="event.stopPropagation();openBatch(${b.id})">详情</button></td>
@@ -177,19 +194,41 @@ async function refreshBatches(){
   }
 }
 
+async function withdrawSample(){
+  const sid = document.getElementById('withdrawId').value.trim();
+  if(!sid){ alert('请填写要撤回的样品号'); return; }
+  if(!confirm(`确认撤回样品号 ${sid}?\n将清除其在全部批次中的入仓行、关联调用记录与批次清单,且不可恢复。`)) return;
+  const resp = await fetch('/api/withdraw',{method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify({sample_id:sid})});
+  const r = await resp.json();
+  document.getElementById('withdrawResult').innerHTML = r.ok
+    ? `<div class="concl">已撤回 <b class="mono">${sid}</b>:清除调用记录 ${r.spans_deleted} 条、`+
+      `入仓行 ${r.warehouse_deleted} 行;涉及批次 [${r.batches_affected.join(', ')||'无'}]`+
+      (r.batches_withdrawn.length?`,其中 [${r.batches_withdrawn.join(', ')}] 样品全部撤回,标记"已撤回"`:'')+
+      `。该号及错位返回号(${r.aliases.join(', ')})已列入拒绝名单,后续提交与迟到上报均不再写入。</div>`
+    : `<div class="concl fail">${r.error||'撤回失败'}</div>`;
+  refreshBatches();
+  if(currentBatch!==null) loadDetail(currentBatch);
+}
+
 async function openBatch(id){ currentBatch=id; await loadDetail(id); }
 async function loadDetail(id){
   const d = await (await fetch('/api/batches/'+id)).json();
   currentDetail = d;
   document.getElementById('detail').hidden = false;
   document.getElementById('detailTitle').textContent =
-    `批次 #${id} 详情(状态 ${d.batch.status},样品 ${d.batch.sample_ids.length} 个)`;
+    `批次 #${id} 详情(状态 ${STATUS_LABEL[d.batch.status]||d.batch.status},样品 ${d.batch.sample_ids.length} 个)`;
   renderConclusion(d); renderChain(d); renderStages(d); renderWaterfall(d);
   renderSpans(d); renderWarehouse(d);
 }
 
 function renderConclusion(d){
   const c = d.conclusion;
+  if(d.batch.status==='withdrawn'){
+    document.getElementById('conclBox').innerHTML =
+      `<div class="concl withdrawn">${c?c.text:'批次样品已全部撤回。'}</div>`;
+    return;
+  }
   document.getElementById('conclBox').innerHTML =
     (d.batch.status==='running' || !c)
     ? `<div class="concl">批次运行中,结论待定稿…(已完成阶段见下方时间线)</div>`
@@ -198,7 +237,7 @@ function renderConclusion(d){
 
 function renderChain(d){
   const c = d.conclusion;
-  if(d.batch.status==='running' || !c){
+  if(d.batch.status==='running' || d.batch.status==='withdrawn' || !c){
     document.getElementById('chainBox').innerHTML=''; return;
   }
   if(!c.chain){
@@ -223,7 +262,9 @@ function renderChain(d){
 
 function renderStages(d){
   const c = d.conclusion;
-  if(d.batch.status==='running' || !c || !c.per_stage){ document.getElementById('stageBox').innerHTML=''; return; }
+  if(d.batch.status==='running' || !c || !c.per_stage || !Object.keys(c.per_stage).length){
+    document.getElementById('stageBox').innerHTML=''; return;
+  }
   const rows = Object.entries(c.per_stage).map(([k,v])=>
     `<tr><td>${v.label}</td><td>${v.attempts}</td><td>${v.sum_s}</td><td>${v.wall_s}</td>
      <td>${v.effective}</td><td>${v.failed}</td><td>${v.late}</td><td>${v.gave_up??0}</td></tr>`).join('');
@@ -302,7 +343,7 @@ async function rerun(){
   const r = await (await fetch('/api/batches',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({sample_ids:currentDetail.batch.sample_ids})})).json();
-  if(r.id){ openBatch(r.id); refreshBatches(); }
+  if(r.id){ openBatch(r.id); refreshBatches(); } else alert(r.error||'提交失败');
 }
 
 loadConfig(); refreshBatches();
